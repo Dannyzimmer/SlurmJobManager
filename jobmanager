@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+import os
+import json
+import time
+import subprocess
+import argparse
+import shlex
+
+
+class JobMetadata:
+    """
+    Easy access to the metadata produced by sacct -j <job-id> --json.
+    """
+    def __init__(self, metadata_file: str):
+        self.metadata_file = metadata_file
+        with open(metadata_file) as fh:
+            self.metadata = json.load(fh)
+        job = self.metadata["jobs"][0]
+        self.user = job["user"]
+        self.group = job["group"]
+        self.cluster = job["cluster"]
+        self.jobid = job["job_id"]
+        self.jobname = job["name"]
+        self.node_group = job["nodes"]
+        self.requested_cpus = job["required"]["CPUs"]
+        self.requested_memory = job["required"]["memory"]
+        self.partition = job["partition"]
+        self.state = job["state"]["current"]
+        self.working_dir = job["working_directory"]
+        # steps may be empty for pending/just-submitted jobs
+        steps = job.get("steps", [])
+        self.requested_nodes = steps[0]["nodes"]["count"] if steps else None
+        self.elapsed = steps[0]["time"]["elapsed"] if steps else 0
+
+
+class Job(JobMetadata):
+    """
+    A class to manage a job by using its metadata produced by sacct -j <job-id> --json.
+    You can also use the jobid to generate the metadata file if you don't have it, but cannot specify both.
+    """
+    def __init__(self, metadata_file: str = "metadata.json", jobid: str = None):
+        metadata_exists = os.path.exists(metadata_file)
+        if metadata_exists and jobid is not None:
+            raise ValueError("You cannot specify both metadata_file and jobid. Please choose one.")
+        elif not metadata_exists and jobid is None:
+            raise ValueError("Metadata file does not exist and jobid is not specified. Please specify one of them.")
+        elif jobid is not None:
+            metadata_file = f"metadata_{jobid}.json"
+            self._generate_metadata_file(metadata_file, jobid)
+        super().__init__(metadata_file)
+
+    def stop_job(self):
+        """Cancels the job via scancel."""
+        subprocess.run(["scancel", str(self.jobid)], check=True)
+
+    def update(self, retries: int = 6, retry_wait: int = 5):
+        """Fetches the latest metadata from SLURM and refreshes all attributes.
+
+        sacct can take several seconds to register a newly submitted job.
+        retries/retry_wait control how long to wait for it to appear.
+        """
+        for attempt in range(1, retries + 1):
+            subprocess.run(
+                f"sacct -j {self.jobid} --json > {self.metadata_file}",
+                shell=True, check=True
+            )
+            with open(self.metadata_file) as fh:
+                data = json.load(fh)
+            if data.get("jobs"):
+                break
+            if attempt < retries:
+                print(f"sacct: job {self.jobid} not yet available, retrying in {retry_wait}s "
+                      f"({attempt}/{retries})...", flush=True)
+                time.sleep(retry_wait)
+        else:
+            raise RuntimeError(
+                f"sacct returned no records for job {self.jobid} after {retries} attempts. "
+                "The job may not be registered in the accounting database yet."
+            )
+        JobMetadata.__init__(self, self.metadata_file)
+
+    def print_summary(self):
+        """Prints a summary of the job information."""
+        self.update()
+        print(f"Job ID:            {self.jobid}")
+        print(f"Job name:          {self.jobname}")
+        print(f"User:              {self.user}")
+        print(f"Group:             {self.group}")
+        print(f"Cluster:           {self.cluster}")
+        print(f"Node group:        {self.node_group}")
+        print(f"CPUs:              {self.requested_cpus}")
+        print(f"Memory:            {self.requested_memory}")
+        print(f"Partition:         {self.partition}")
+        print(f"Elapsed time:      {self.elapsed}")
+        print(f"State:             {self.state}")
+        print(f"Working directory: {self.working_dir}")
+
+    def get_status(self):
+        """Returns the current status of the job."""
+        self.update()
+        return self.state
+
+    def get_elapsed_time(self):
+        """Returns the elapsed time of the job."""
+        self.update()
+        return self.elapsed
+
+    def _get_output_file(self) -> str:
+        """Returns the resolved stdout path for this job using scontrol."""
+        try:
+            result = subprocess.run(
+                ["scontrol", "show", "job", str(self.jobid)],
+                capture_output=True, text=True, check=True,
+            )
+            for token in result.stdout.split():
+                if token.startswith("StdOut="):
+                    return token.split("=", 1)[1]
+        except subprocess.CalledProcessError:
+            pass
+        return None
+
+    def watch(self, interval: int = 1):
+        """Follows the job's output file in real time until it reaches a terminal state."""
+        terminal_states = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY"}
+
+        output_file = self._get_output_file()
+        if not output_file:
+            raise RuntimeError(
+                f"Could not determine output file for job {self.jobid}. "
+                "The job may no longer be in the queue (scontrol only tracks active jobs)."
+            )
+
+        print(f"Job {self.jobid} ({self.jobname}) | output: {output_file}")
+        print("Press Ctrl+C to stop.\n", flush=True)
+
+        # Wait for job to start and create the output file (may be PENDING)
+        while not os.path.exists(output_file):
+            state = self.get_status()
+            if state in terminal_states:
+                print(f"Job ended ({state}) before producing output.")
+                return
+            print(f"  [{time.strftime('%H:%M:%S')}] {state} — waiting for job to start...", flush=True)
+            time.sleep(interval)
+
+        try:
+            with open(output_file) as fh:
+                while True:
+                    chunk = fh.read()
+                    if chunk:
+                        print(chunk, end="", flush=True)
+                    time.sleep(interval)
+                    state = self.get_status()
+                    if state in terminal_states:
+                        # Final drain
+                        chunk = fh.read()
+                        if chunk:
+                            print(chunk, end="", flush=True)
+                        print(f"\n[{time.strftime('%H:%M:%S')}] Job {self.jobid} — {state}")
+                        break
+        except KeyboardInterrupt:
+            print("\nWatch interrupted by user.")
+
+    def _generate_metadata_file(self, metadata_file: str, jobid: str):
+        """Fetches metadata for *jobid* from SLURM and writes it to *metadata_file*."""
+        if os.path.exists(metadata_file):
+            raise FileExistsError(
+                f"File {metadata_file} already exists. "
+                "Please choose a different name or delete the existing file."
+            )
+        subprocess.run(
+            f"sacct -j {jobid} --json > {metadata_file}",
+            shell=True, check=True
+        )
+        return metadata_file
+
+    def print_request_script(self):
+        """Prints a SLURM batch script with the same resource requests as this job."""
+        print("#!/bin/bash")
+        print(f"#SBATCH --job-name={self.jobname}")
+        print(f"#SBATCH --partition={self.partition}")
+        print(f"#SBATCH --nodes={self.requested_nodes}")
+        print(f"#SBATCH --cpus-per-task={self.requested_cpus}")
+        print(f"#SBATCH --mem={self.requested_memory}")
+
+    def _get_submitline(self) -> str:
+        """Fetches submitline from sacct and returns the second output line as a shell command."""
+        try:
+            result = subprocess.run(
+                ["sacct", "-j", str(self.jobid), "-o", "submitline", "-P"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or "").strip()
+            raise RuntimeError(
+                f"Failed to retrieve submitline for job {self.jobid} using sacct. {stderr}"
+            ) from exc
+
+        lines = result.stdout.splitlines()
+        if len(lines) < 2:
+            raise RuntimeError(
+                f"sacct did not return a submitline for job {self.jobid}. Output: {result.stdout!r}"
+            )
+
+        submitline = lines[1].rstrip("|").strip()
+        if not submitline:
+            raise RuntimeError(f"Empty submitline returned for job {self.jobid}.")
+        return submitline
+
+    def print_request_cmd(self) -> str:
+        """Prints and returns the original submission command from sacct submitline."""
+        submitline = self._get_submitline()
+        print(submitline)
+        return submitline
+
+    def submit(self) -> str:
+        """Resubmits the job by executing the command from sacct submitline."""
+        submitline = self._get_submitline()
+        argv = shlex.split(submitline)
+        if not argv:
+            raise RuntimeError(f"Empty submitline returned for job {self.jobid}.")
+
+        # sacct may return an unquoted --wrap command. If present, rebuild it
+        # as a single argument using all trailing tokens.
+        if "--wrap" in argv:
+            wrap_idx = argv.index("--wrap")
+            if wrap_idx + 1 >= len(argv):
+                raise RuntimeError(f"Invalid submitline for job {self.jobid}: missing value for --wrap.")
+            wrap_cmd = " ".join(argv[wrap_idx + 1:])
+            argv = argv[:wrap_idx + 2]
+            argv[wrap_idx + 1] = wrap_cmd
+        else:
+            wrap_eq_idx = next((i for i, token in enumerate(argv) if token.startswith("--wrap=")), -1)
+            if wrap_eq_idx != -1:
+                wrap_first = argv[wrap_eq_idx].split("=", 1)[1]
+                wrap_cmd = " ".join([wrap_first] + argv[wrap_eq_idx + 1:]).strip()
+                if not wrap_cmd:
+                    raise RuntimeError(f"Invalid submitline for job {self.jobid}: empty value for --wrap.")
+                argv = argv[:wrap_eq_idx] + ["--wrap", wrap_cmd]
+
+        try:
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or "").strip()
+            raise RuntimeError(
+                f"Failed to submit job using submitline for job {self.jobid}. {stderr}"
+            ) from exc
+
+        output = result.stdout.strip()
+        parts = output.split()
+        if parts and parts[-1].isdigit():
+            new_job_id = parts[-1]
+            # Point this instance to the new job and refresh metadata.json via update()
+            self.jobid = new_job_id
+            self.update()
+            return new_job_id
+        return output
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers (do not require an existing Job instance)
+# ---------------------------------------------------------------------------
+
+def list_jobs(user: str = None) -> None:
+    """Prints the active jobs for *user* (defaults to current user)."""
+    if user is None:
+        user = os.environ.get("USER", os.environ.get("LOGNAME", ""))
+    fmt = "%.10i %.20j %.8u %.8T %.10M %.6D %R"
+    subprocess.run(["squeue", "-u", user, f"--format={fmt}"], check=True)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="jobmanager",
+        description="Manage SLURM jobs via sacct/squeue/sbatch/scancel.",
+    )
+    subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
+    subparsers.required = True
+
+    # --- helpers shared by job-specific subcommands ---
+    def add_job_args(p):
+        group = p.add_mutually_exclusive_group(required=False)
+        group.add_argument("--jobid", metavar="ID", help="SLURM job ID")
+        group.add_argument(
+            "--metadata", metavar="FILE",
+            help="Path to sacct JSON metadata file (default: metadata.json in cwd if it exists)."
+        )
+
+    # status
+    p_status = subparsers.add_parser("status", help="Print the current state of a job.")
+    add_job_args(p_status)
+
+    # summary
+    p_summary = subparsers.add_parser("summary", help="Print a full summary of a job.")
+    add_job_args(p_summary)
+
+    # elapsed
+    p_elapsed = subparsers.add_parser("elapsed", help="Print the elapsed time of a job.")
+    add_job_args(p_elapsed)
+
+    # stop
+    p_stop = subparsers.add_parser("stop", help="Cancel a running job (scancel).")
+    add_job_args(p_stop)
+    p_stop.add_argument(
+        "--yes", action="store_true",
+        help="Skip confirmation prompt."
+    )
+
+    # print-request
+    p_write = subparsers.add_parser(
+        "print-request",
+        help="Print a SLURM batch script with the same resource requests (redirect to save)."
+    )
+    add_job_args(p_write)
+
+    # watch
+    p_watch = subparsers.add_parser(
+        "watch",
+        help="Stream the job's output file in real time until it reaches a terminal state."
+    )
+    add_job_args(p_watch)
+    p_watch.add_argument(
+        "--interval", type=int, default=1, metavar="N",
+        help="Seconds between reads/state checks (default: 1)."
+    )
+
+    # resubmit
+    p_submit = subparsers.add_parser(
+        "resubmit",
+        help="Resubmit using the command from: sacct -j <jobid> -o submitline -P."
+    )
+    add_job_args(p_submit)
+
+    # list
+    p_list = subparsers.add_parser("list", help="List active jobs (squeue).")
+    p_list.add_argument(
+        "--user", metavar="USER", default=None,
+        help="Username to filter by (default: current user)."
+    )
+
+    return parser
+
+
+def _load_job(args) -> "Job":
+    """Instantiate Job from --jobid, --metadata, or the default metadata.json in cwd."""
+    if args.jobid is not None:
+        return Job(jobid=args.jobid)
+    if args.metadata is not None:
+        return Job(metadata_file=args.metadata)
+    default = "metadata.json"
+    if os.path.exists(default):
+        return Job(metadata_file=default)
+    raise SystemExit(
+        "No job specified. Use --jobid or --metadata, "
+        "or place a metadata.json file in the current directory."
+    )
+
+
+def main():
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    if args.command == "status":
+        job = _load_job(args)
+        print(job.get_status())
+
+    elif args.command == "summary":
+        job = _load_job(args)
+        job.print_summary()
+
+    elif args.command == "elapsed":
+        job = _load_job(args)
+        print(job.get_elapsed_time())
+
+    elif args.command == "stop":
+        job = _load_job(args)
+        if not args.yes:
+            confirm = input(f"Cancel job {job.jobid} ({job.jobname})? [y/N] ").strip().lower()
+            if confirm != "y":
+                print("Aborted.")
+                return
+        job.stop_job()
+        print(f"Job {job.jobid} cancelled.")
+
+    elif args.command == "print-request":
+        job = _load_job(args)
+        job.print_request_script()
+
+    elif args.command == "watch":
+        job = _load_job(args)
+        job.watch(interval=args.interval)
+
+    elif args.command == "resubmit":
+        job = _load_job(args)
+        job_id = job.submit()
+        print(f"Submitted - job ID: {job_id}")
+
+    elif args.command == "list":
+        list_jobs(user=args.user)
+
+
+if __name__ == "__main__":
+    main()
