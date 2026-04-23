@@ -31,9 +31,7 @@ def _fetch_metadata(jobid: str, output_file: str, retries: int = 6, retry_wait: 
 
 
 class JobMetadata:
-    """
-    Easy access to the metadata produced by sacct -j <job-id> --json.
-    """
+    """Parses `sacct -j <job-id> --json` output and exposes job attributes."""
     def __init__(self, metadata_file: str):
         self.metadata_file = metadata_file
         with open(metadata_file) as fh:
@@ -57,10 +55,7 @@ class JobMetadata:
 
 
 class Job(JobMetadata):
-    """
-    A class to manage a job by using its metadata produced by sacct -j <job-id> --json.
-    You can also use the jobid to generate the metadata file if you don't have it, but cannot specify both.
-    """
+    """Manages a SLURM job. Accepts a metadata file path OR a job ID (not both)."""
     def __init__(self, metadata_file: str = "metadata.json", jobid: str = None):
         metadata_exists = os.path.exists(metadata_file)
         if metadata_exists and jobid is not None:
@@ -77,11 +72,8 @@ class Job(JobMetadata):
         subprocess.run(["scancel", str(self.jobid)], check=True)
 
     def update(self, retries: int = 6, retry_wait: int = 5):
-        """Fetches the latest metadata from SLURM and refreshes all attributes.
-
-        sacct can take several seconds to register a newly submitted job.
-        retries/retry_wait control how long to wait for it to appear.
-        """
+        """Refresh all attributes from SLURM. Retries up to *retries* times if sacct
+        has not registered the job yet, waiting *retry_wait* seconds between attempts."""
         _fetch_metadata(str(self.jobid), self.metadata_file, retries, retry_wait)
         JobMetadata.__init__(self, self.metadata_file)
 
@@ -309,13 +301,59 @@ def _check_and_handle_active_job(metadata_file: str = "metadata.json") -> bool:
     return True
 
 
-def _create_template(quick: bool = False, medium: bool = False) -> None:
-    """Write a SLURM batch script template (run.sh) in the current directory."""
+def _validate_script_resources(script: str) -> list:
+    """Return a list of #SBATCH resource directives set to zero in *script*.
+
+    Checks --nodes, --ntasks, --cpus-per-task, --mem, and --time.
+    A time value is considered zero when all its digit characters are '0'.
+    """
+    resource_keys = {"--nodes", "--ntasks", "--cpus-per-task", "--mem", "--time"}
+    offenders = []
+    with open(script) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line.startswith("#SBATCH"):
+                continue
+            parts = line.split(None, 1)
+            if len(parts) < 2 or "=" not in parts[1]:
+                continue
+            key, val = parts[1].split("=", 1)
+            key, val = key.strip(), val.strip()
+            if key not in resource_keys:
+                continue
+            if key == "--time":
+                is_zero = val and all(c == "0" for c in val if c.isdigit())
+            elif key == "--mem":
+                numeric = val.rstrip("GgMmKkBb")
+                try:
+                    is_zero = float(numeric) == 0
+                except ValueError:
+                    is_zero = False
+            else:
+                try:
+                    is_zero = int(val) == 0
+                except ValueError:
+                    is_zero = False
+            if is_zero:
+                offenders.append(f"{key}={val}")
+    return offenders
+
+
+def _create_template(quick: bool = False, medium: bool = False, test: bool = False) -> None:
+    """Write a SLURM batch script template (run.sh) in the current directory.
+
+    Preset sizes — test: minimal (1 node/task/CPU, 1 GB, 1 min);
+    quick: small (1 node, 1 task, 2 CPUs, 4 GB, 1 h);
+    medium: moderate (1 node, 4 tasks, 8 CPUs, 32 GB, 24 h);
+    default: all zeros (must be filled manually before submitting).
+    """
     dest = "run.sh"
     if os.path.exists(dest):
         raise SystemExit(f"{dest} already exists in the current directory.")
     dirname = os.path.basename(os.getcwd())
-    if quick:
+    if test:
+        nodes, ntasks, cpus, mem, walltime = 1, 1, 1, "1G", "0-00:01:00"
+    elif quick:
         nodes, ntasks, cpus, mem, walltime = 1, 1, 2, "4G", "0-01:00:00"
     elif medium:
         nodes, ntasks, cpus, mem, walltime = 1, 4, 8, "32G", "1-00:00:00"
@@ -415,12 +453,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     size = p_template.add_mutually_exclusive_group()
     size.add_argument(
+        "--test", action="store_true",
+        help="Minimal resources: 1 node, 1 task, 1 CPU, 1 GB, 1 min.",
+    )
+    size.add_argument(
         "--quick", action="store_true",
-        help="Pre-fill with small resource values (1 node, 1 task, 2 CPUs, 4 GB, 1 h).",
+        help="Small resources: 1 node, 1 task, 2 CPUs, 4 GB, 1 h.",
     )
     size.add_argument(
         "--medium", action="store_true",
-        help="Pre-fill with medium resource values (1 node, 4 tasks, 8 CPUs, 32 GB, 24 h).",
+        help="Medium resources: 1 node, 4 tasks, 8 CPUs, 32 GB, 24 h.",
     )
 
     # submit
@@ -493,12 +535,19 @@ def main():
         job.watch(interval=args.interval)
 
     elif args.command == "template":
-        _create_template(quick=args.quick, medium=args.medium)
+        _create_template(quick=args.quick, medium=args.medium, test=args.test)
 
     elif args.command == "submit":
         script = args.script if args.script is not None else "run.sh"
         if not os.path.exists(script):
             raise SystemExit(f"Script not found: {script!r}")
+        zero_params = _validate_script_resources(script)
+        if zero_params:
+            raise SystemExit(
+                "The following resource parameters are still set to zero in the script:\n"
+                + "".join(f"  {p}\n" for p in zero_params)
+                + "Edit the script and set valid resource values before submitting."
+            )
         if not _check_and_handle_active_job():
             return
         try:
