@@ -5,6 +5,7 @@ import time
 import subprocess
 import argparse
 import shlex
+from jobmanager import __version__
 
 _TERMINAL_STATES = frozenset({"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY"})
 _LOG_DIR = "job_logs"
@@ -389,6 +390,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jobmanager",
         description="Manage SLURM jobs via sacct/squeue/sbatch/scancel.",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
     )
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
     subparsers.required = True
