@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slurm-jobmanager"
+dynamic = ["version"]
+description = "CLI tool to manage SLURM jobs via sacct/squeue/sbatch/scancel"
+authors = [
+    {name = "Daniel Pérez Rodríguez"}
+]
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.7"
+
+[project.scripts]
+jobmanager = "jobmanager.cli:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "jobmanager.__version__"}
