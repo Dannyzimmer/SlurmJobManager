@@ -6,6 +6,29 @@ import subprocess
 import argparse
 import shlex
 
+_TERMINAL_STATES = frozenset({"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY"})
+
+
+def _fetch_metadata(jobid: str, output_file: str, retries: int = 6, retry_wait: int = 5) -> None:
+    """Fetch sacct JSON metadata for *jobid* into *output_file*, retrying until the record appears."""
+    for attempt in range(1, retries + 1):
+        subprocess.run(
+            f"sacct -j {jobid} --json > {output_file}",
+            shell=True, check=True
+        )
+        with open(output_file) as fh:
+            data = json.load(fh)
+        if data.get("jobs"):
+            return
+        if attempt < retries:
+            print(f"sacct: job {jobid} not yet available, retrying in {retry_wait}s "
+                  f"({attempt}/{retries})...", flush=True)
+            time.sleep(retry_wait)
+    raise RuntimeError(
+        f"sacct returned no records for job {jobid} after {retries} attempts. "
+        "The job may not be registered in the accounting database yet."
+    )
+
 
 class JobMetadata:
     """
@@ -59,24 +82,7 @@ class Job(JobMetadata):
         sacct can take several seconds to register a newly submitted job.
         retries/retry_wait control how long to wait for it to appear.
         """
-        for attempt in range(1, retries + 1):
-            subprocess.run(
-                f"sacct -j {self.jobid} --json > {self.metadata_file}",
-                shell=True, check=True
-            )
-            with open(self.metadata_file) as fh:
-                data = json.load(fh)
-            if data.get("jobs"):
-                break
-            if attempt < retries:
-                print(f"sacct: job {self.jobid} not yet available, retrying in {retry_wait}s "
-                      f"({attempt}/{retries})...", flush=True)
-                time.sleep(retry_wait)
-        else:
-            raise RuntimeError(
-                f"sacct returned no records for job {self.jobid} after {retries} attempts. "
-                "The job may not be registered in the accounting database yet."
-            )
+        _fetch_metadata(str(self.jobid), self.metadata_file, retries, retry_wait)
         JobMetadata.__init__(self, self.metadata_file)
 
     def print_summary(self):
@@ -121,7 +127,7 @@ class Job(JobMetadata):
 
     def watch(self, interval: int = 1):
         """Follows the job's output file in real time until it reaches a terminal state."""
-        terminal_states = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY"}
+        terminal_states = _TERMINAL_STATES
 
         output_file = self._get_output_file()
         if not output_file:
@@ -275,6 +281,67 @@ def list_jobs(user: str = None) -> None:
     subprocess.run(["squeue", "-u", user, f"--format={fmt}"], check=True)
 
 
+def _check_and_handle_active_job(metadata_file: str = "metadata.json") -> bool:
+    """Check whether the job tracked in *metadata_file* is still active.
+
+    If active, warn the user and offer to cancel it.
+    Returns True if it is safe to proceed, False if the user chose to abort.
+    """
+    if not os.path.exists(metadata_file):
+        return True
+    try:
+        job = Job(metadata_file=metadata_file)
+        job.update()
+    except Exception:
+        return True  # Cannot determine state; allow proceeding
+    if job.state not in _TERMINAL_STATES:
+        print(
+            f"Warning: job {job.jobid} ({job.jobname}) is currently {job.state}.\n"
+            "You must cancel it before proceeding."
+        )
+        confirm = input("Cancel the active job and continue? [y/N] ").strip().lower()
+        if confirm == "y":
+            job.stop_job()
+            print(f"Job {job.jobid} cancelled.")
+            return True
+        print("Aborted.")
+        return False
+    return True
+
+
+def _create_template(quick: bool = False, medium: bool = False) -> None:
+    """Write a SLURM batch script template (run.sh) in the current directory."""
+    dest = "run.sh"
+    if os.path.exists(dest):
+        raise SystemExit(f"{dest} already exists in the current directory.")
+    dirname = os.path.basename(os.getcwd())
+    if quick:
+        nodes, ntasks, cpus, mem, walltime = 1, 1, 2, "4G", "0-01:00:00"
+    elif medium:
+        nodes, ntasks, cpus, mem, walltime = 1, 4, 8, "32G", "1-00:00:00"
+    else:
+        nodes, ntasks, cpus, mem, walltime = 0, 0, 0, "0G", "0-00:00:00"
+    content = (
+        "#!/bin/bash\n"
+        f"#SBATCH --job-name={dirname}\n"
+        f"#SBATCH --nodes={nodes}\n"
+        f"#SBATCH --ntasks={ntasks}\n"
+        f"#SBATCH --cpus-per-task={cpus}\n"
+        f"#SBATCH --mem={mem}\n"
+        f"#SBATCH --time={walltime}\n"
+        "#SBATCH --output=LOG_%x.log\n"
+        "\n"
+        "sleep 10\n"
+        "sacct -j $SLURM_JOBID --json > metadata.json\n"
+        "\n"
+        "# === INSERT BELOW YOUR CODE ===\n"
+    )
+    with open(dest, "w") as fh:
+        fh.write(content)
+    os.chmod(dest, 0o755)
+    print(f"Created {dest}  (job-name: {dirname})")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -341,6 +408,31 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     add_job_args(p_submit)
 
+    # template
+    p_template = subparsers.add_parser(
+        "template",
+        help="Create a run.sh SLURM batch script template in the current directory.",
+    )
+    size = p_template.add_mutually_exclusive_group()
+    size.add_argument(
+        "--quick", action="store_true",
+        help="Pre-fill with small resource values (1 node, 1 task, 2 CPUs, 4 GB, 1 h).",
+    )
+    size.add_argument(
+        "--medium", action="store_true",
+        help="Pre-fill with medium resource values (1 node, 4 tasks, 8 CPUs, 32 GB, 24 h).",
+    )
+
+    # submit
+    p_submit_cmd = subparsers.add_parser(
+        "submit",
+        help="Submit a batch script via sbatch (default: run.sh in the current directory).",
+    )
+    p_submit_cmd.add_argument(
+        "script", nargs="?", default=None, metavar="SCRIPT",
+        help="Path to the batch script to submit (default: run.sh).",
+    )
+
     # list
     p_list = subparsers.add_parser("list", help="List active jobs (squeue).")
     p_list.add_argument(
@@ -400,7 +492,32 @@ def main():
         job = _load_job(args)
         job.watch(interval=args.interval)
 
+    elif args.command == "template":
+        _create_template(quick=args.quick, medium=args.medium)
+
+    elif args.command == "submit":
+        script = args.script if args.script is not None else "run.sh"
+        if not os.path.exists(script):
+            raise SystemExit(f"Script not found: {script!r}")
+        if not _check_and_handle_active_job():
+            return
+        try:
+            result = subprocess.run(
+                ["sbatch", script], capture_output=True, text=True, check=True
+            )
+        except subprocess.CalledProcessError as exc:
+            raise SystemExit((exc.stderr or exc.stdout).strip()) from exc
+        output = result.stdout.strip()
+        parts = output.split()
+        if not (parts and parts[-1].isdigit()):
+            raise SystemExit(f"Could not parse job ID from sbatch output: {output!r}")
+        new_job_id = parts[-1]
+        _fetch_metadata(new_job_id, "metadata.json")
+        print(f"Submitted - job ID: {new_job_id}")
+
     elif args.command == "resubmit":
+        if not _check_and_handle_active_job():
+            return
         job = _load_job(args)
         job_id = job.submit()
         print(f"Submitted - job ID: {job_id}")
