@@ -444,6 +444,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Resubmit using the command from: sacct -j <jobid> -o submitline -P."
     )
     add_job_args(p_submit)
+    p_submit.add_argument(
+        "-w", "--watch", action="store_true",
+        help="Stream the job output in real time after resubmission.",
+    )
 
     # template
     p_template = subparsers.add_parser(
@@ -472,6 +476,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_submit_cmd.add_argument(
         "script", nargs="?", default=None, metavar="SCRIPT",
         help="Path to the batch script to submit (default: run.sh).",
+    )
+    p_submit_cmd.add_argument(
+        "-w", "--watch", action="store_true",
+        help="Stream the job output in real time after submission.",
     )
 
     # list
@@ -563,6 +571,8 @@ def main():
         new_job_id = parts[-1]
         _fetch_metadata(new_job_id, "metadata.json")
         print(f"Submitted - job ID: {new_job_id}")
+        if args.watch:
+            Job(metadata_file="metadata.json").watch()
 
     elif args.command == "resubmit":
         if not _check_and_handle_active_job():
@@ -570,6 +580,8 @@ def main():
         job = _load_job(args)
         job_id = job.submit()
         print(f"Submitted - job ID: {job_id}")
+        if args.watch:
+            job.watch()
 
     elif args.command == "list":
         list_jobs(user=args.user)
