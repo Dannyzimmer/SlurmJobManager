@@ -374,7 +374,7 @@ def _create_template(quick: bool = False, medium: bool = False, test: bool = Fal
         "sleep 10\n"
         "sacct -j $SLURM_JOBID --json > metadata.json\n"
         "\n"
-        "# === INSERT BELOW YOUR CODE ===\n"
+        "# === INSERT YOUR CODE BELOW ===\n"
     )
     with open(dest, "w") as fh:
         fh.write(content)
