@@ -58,15 +58,17 @@ class JobMetadata:
 
 class Job(JobMetadata):
     """Manages a SLURM job. Accepts a metadata file path OR a job ID (not both)."""
-    def __init__(self, metadata_file: str = "metadata.json", jobid: str = None):
-        metadata_exists = os.path.exists(metadata_file)
-        if metadata_exists and jobid is not None:
+    def __init__(self, metadata_file: str = None, jobid: str = None):
+        if metadata_file is not None and jobid is not None:
             raise ValueError("You cannot specify both metadata_file and jobid. Please choose one.")
-        elif not metadata_exists and jobid is None:
-            raise ValueError("Metadata file does not exist and jobid is not specified. Please specify one of them.")
         elif jobid is not None:
             metadata_file = f"metadata_{jobid}.json"
-            self._generate_metadata_file(metadata_file, jobid)
+            _fetch_metadata(jobid, metadata_file)
+        elif metadata_file is None:
+            default = "metadata.json"
+            if not os.path.exists(default):
+                raise ValueError("Metadata file does not exist and jobid is not specified. Please specify one of them.")
+            metadata_file = default
         super().__init__(metadata_file)
 
     def stop_job(self):
@@ -159,19 +161,6 @@ class Job(JobMetadata):
                         break
         except KeyboardInterrupt:
             print("\nWatch interrupted by user.")
-
-    def _generate_metadata_file(self, metadata_file: str, jobid: str):
-        """Fetches metadata for *jobid* from SLURM and writes it to *metadata_file*."""
-        if os.path.exists(metadata_file):
-            raise FileExistsError(
-                f"File {metadata_file} already exists. "
-                "Please choose a different name or delete the existing file."
-            )
-        subprocess.run(
-            f"sacct -j {jobid} --json > {metadata_file}",
-            shell=True, check=True
-        )
-        return metadata_file
 
     def print_request_script(self):
         """Prints a SLURM batch script with the same resource requests as this job."""
