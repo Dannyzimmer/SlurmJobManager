@@ -121,6 +121,10 @@ class Job(JobMetadata):
             pass
         return None
 
+    def _cursorup(self, n, *args, **kwargs):
+        kwargs.setdefault("end", "")
+        print(f"\r\033[{n}A", *args, **kwargs)
+
     def watch(self, interval: int = 1):
         """Follows the job's output file in real time until it reaches a terminal state."""
         terminal_states = _TERMINAL_STATES
@@ -142,6 +146,7 @@ class Job(JobMetadata):
                 print(f"Job ended ({state}) before producing output.")
                 return
             print(f"  [{time.strftime('%H:%M:%S')}] {state} — waiting for job to start...", flush=True)
+            self._cursorup(1)
             time.sleep(interval)
 
         try:
