@@ -424,7 +424,10 @@ def _create_template(quick: bool = False, medium: bool = False, test: bool = Fal
     """
     dest = "run.sh"
     if os.path.exists(dest):
-        raise SystemExit(f"{dest} already exists in the current directory.")
+        confirm = input(f"{dest} already exists. Overwrite? [y/N] ").strip().lower()
+        if confirm != "y":
+            print("Aborted.")
+            return
     dirname = os.path.basename(os.getcwd())
     if test:
         nodes, ntasks, cpus, mem, walltime = 1, 1, 1, "1G", "0-00:01:00"

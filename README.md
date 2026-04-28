@@ -4,8 +4,9 @@ A command-line tool to manage SLURM jobs via `sacct`, `squeue`, `sbatch`, and `s
 
 ## Requirements
 
-- Python 3
+- Python 3.7+
 - SLURM (`sacct`, `squeue`, `scontrol`, `scancel`)
+- PyYAML (`pip install pyyaml`, included as a dependency)
 
 ## Installation
 
@@ -122,6 +123,32 @@ jobmanager template --test     # 1 node, 1 task, 1 CPU, 1 GB, 1 min
 jobmanager template --quick    # 1 node, 1 task, 2 CPUs, 4 GB, 1 h
 jobmanager template --medium   # 1 node, 4 tasks, 8 CPUs, 32 GB, 24 h
 ```
+
+If a `requirements.txt` is present in the current directory, `jobmanager template`
+automatically appends a virtualenv setup block to the script:
+
+```bash
+# module load python/3.11   ← only if module_loads is set in config
+python3 -m venv .venv         # or ${TMPDIR}/.venv_${SLURM_JOBID} if tmp_dir_var is set
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### `config`
+Manage the configuration file (`~/.config/jobmanager/config.yaml`).
+```bash
+jobmanager config init    # create the config file with documented defaults
+jobmanager config edit    # open the config file in an interactive editor
+```
+
+Available settings:
+
+| Key | Default | Description |
+|---|---|---|
+| `tmp_dir_var` | *(unset)* | Environment variable holding the node's local temp dir (e.g. `TMPDIR`, `LOCAL_SCRATCH`). Used for venv placement. |
+| `module_loads` | `[]` | List of environment modules to load before creating a virtualenv. |
+| `log_dir` | `job_logs` | Directory for SLURM log files (relative to the working directory). |
+| `sacct_retries` | `6` | Times to retry `sacct` when a job is not yet registered in the accounting DB. |
 
 ### `submit`
 Validate and submit a batch script via `sbatch`. Checks for zero-value resource
